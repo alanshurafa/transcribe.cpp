@@ -316,6 +316,15 @@ int main(int argc, char ** argv) {
     }
     const bool quiet = args.quiet;
 
+    // Register the compute backends before resolving --device or loading the
+    // model. A dynamic-backend build has none until this runs (no-op when the
+    // backends are compiled in).
+    const transcribe_status init_st = transcribe_init_backends_default();
+    if (init_st != TRANSCRIBE_OK) {
+        std::fprintf(stderr, "error: transcribe_init_backends_default: %s\n", transcribe_status_string(init_st));
+        return EXIT_FAILURE;
+    }
+
     if (!quiet) {
         std::fprintf(stderr, "loading sample %s\n", args.sample_path.c_str());
     }

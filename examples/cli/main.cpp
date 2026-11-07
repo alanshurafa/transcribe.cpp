@@ -671,6 +671,15 @@ int main(int argc, char ** argv) {
         transcribe_log_set(log_cb, nullptr);
     }
 
+    // Register the compute backends once, before any model load. A
+    // dynamic-backend build has none until this runs (no-op when the
+    // backends are compiled in).
+    const transcribe_status init_st = transcribe_init_backends_default();
+    if (init_st != TRANSCRIBE_OK) {
+        std::fprintf(stderr, "error: transcribe_init_backends_default: %s\n", transcribe_status_string(init_st));
+        return EXIT_FAILURE;
+    }
+
     std::ofstream   output_file;
     std::ofstream * output = nullptr;
     if (!args.output_path.empty()) {
