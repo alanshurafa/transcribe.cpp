@@ -124,6 +124,16 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // Register the compute backends before the first model load. A
+    // dynamic-backend build has none until this runs (no-op when the
+    // backends are compiled in).
+    transcribe_status init_st = transcribe_init_backends_default();
+    if (init_st != TRANSCRIBE_OK) {
+        fprintf(stderr, "error: transcribe_init_backends_default: %s\n", transcribe_status_string(init_st));
+        free(pcm);
+        return 1;
+    }
+
     // 2. Open a session. NULL params == library defaults. transcribe_open
     //    returns a session that owns its model; transcribe_session_free
     //    later frees both.
