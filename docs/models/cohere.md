@@ -41,11 +41,11 @@ each per-variant doc has direct download links.
 
 ## Input limits
 
-Every variant accepts up to about **6.7 minutes (400 s)** of 16 kHz mono audio
-per call — the encoder's positional table is the binding limit, shared across
-the family. Longer audio is rejected up front with
-`TRANSCRIBE_ERR_INPUT_TOO_LONG` rather than silently truncated; split it into
-shorter segments. See the [input-length contract](../input-limits.md).
+Every variant accepts audio of any length. The model was trained on clips of
+up to 35 s, so longer audio is split at quiet points into pieces of at most
+35 s, each piece is transcribed on its own, and the texts are joined, as the
+reference processor does. `max_audio_ms` is 0 (no practical limit). See the
+[input-length contract](../input-limits.md).
 
 ## Quick start
 

@@ -57,11 +57,15 @@ value at the default context; for the effective limit under a lowered
 
 | Families | Limit | Behavior |
 | --- | --- | --- |
-| whisper, parakeet (all variants), voxtral_realtime, gigaam | none (`max_audio_ms = 0`) | Long audio is windowed internally and stitched (whisper, gigaam), processed by an unbounded/streaming encoder (parakeet, voxtral_realtime), or padded if short. No practical limit; all four **ignore `n_ctx`** (it cannot lower a limit they don't have). whisper, parakeet and gigaam never error on length. voxtral_realtime has one exception — its absolute `dec_max_position` cap (~2.9 h, see below): a clip past it returns `INPUT_TOO_LONG` (one-shot/batch), and a stream that reaches it flags `was_truncated`. |
+| whisper, parakeet (all variants), voxtral_realtime, gigaam, cohere | none (`max_audio_ms = 0`) | Long audio is windowed internally and stitched (whisper, gigaam, cohere), processed by an unbounded/streaming encoder (parakeet, voxtral_realtime), or padded if short. No practical limit; all but cohere **ignore `n_ctx`** (it cannot lower a limit they don't have). whisper, parakeet, gigaam and cohere never error on length. voxtral_realtime has one exception — its absolute `dec_max_position` cap (~2.9 h, see below): a clip past it returns `INPUT_TOO_LONG` (one-shot/batch), and a stream that reaches it flags `was_truncated`. |
 
 Whisper slices audio into 30 s windows with prev-context stitching; gigaam
 encodes audio past its 25 s training window in overlapping windows of at most
-25 s and decodes the stitched encoder frames in one greedy pass; parakeet's
+25 s and decodes the stitched encoder frames in one greedy pass; cohere splits
+audio longer than its 35 s training clip (`max_audio_clip_s`) at the quietest
+100 ms inside the last 5 s of each 35 s step, decodes each piece on its own and
+joins the texts, as the reference processor does (`n_ctx` still bounds each
+piece's decoder output); parakeet's
 conformer is effectively unbounded (the encoder positional table is recomputed
 per run, not a fixed wall). This holds for every parakeet variant, including the
 cache-aware streaming RNN-T member (`nemotron-3.5-asr-streaming-0.6b`): the
@@ -74,7 +78,7 @@ need and do not have a length gate.
 
 | Families | Limit source | Behavior |
 | --- | --- | --- |
-| qwen3_asr, canary_qwen, funasr_nano, granite, granite_nar, voxtral, cohere, canary, moonshine_streaming | decoder context window (`dec_max_position_embeddings` / `dec_max_seq`), or an encoder-side positional table (`enc_pos_emb_max_len` for cohere/canary; the adapter `pos_emb` table, 4096 frames = 81.9 s, for moonshine_streaming) — all from GGUF | KV cache grows to fit, clamped to the model's true max. Over-length input is **rejected before the decode** (or before the encoder, where the encoder table is the binding limit) with `TRANSCRIBE_ERR_INPUT_TOO_LONG`. A moonshine_streaming *stream* that reaches its cap is truncated instead (see "Streaming is the exception"). |
+| qwen3_asr, canary_qwen, funasr_nano, granite, granite_nar, voxtral, canary, moonshine_streaming | decoder context window (`dec_max_position_embeddings` / `dec_max_seq`), or an encoder-side positional table (`enc_pos_emb_max_len` for canary; the adapter `pos_emb` table, 4096 frames = 81.9 s, for moonshine_streaming) — all from GGUF | KV cache grows to fit, clamped to the model's true max. Over-length input is **rejected before the decode** (or before the encoder, where the encoder table is the binding limit) with `TRANSCRIBE_ERR_INPUT_TOO_LONG`. A moonshine_streaming *stream* that reaches its cap is truncated instead (see "Streaming is the exception"). |
 
 A clip's sample count deterministically fixes its decoder prefill size or
 encoder frame count, so the library checks the relevant bound before running
@@ -93,9 +97,8 @@ still returns `TRANSCRIBE_OK`).
 
 Autoregressive families scale the decode budget with audio length, capped by
 the remaining decoder context. Lowering `n_ctx` can therefore make truncation
-more likely. For `canary` and `cohere`, input and output have separate encoder
-and decoder limits; `max_audio_ms` reports the encoder limit, not a recommended
-chunk size.
+more likely. For `canary`, input and output have separate encoder and decoder
+limits; `max_audio_ms` reports the encoder limit, not a recommended chunk size.
 
 A greedy decode can also fall into repeating one phrase until the budget runs
 out. The greedy families (`canary`, `canary_qwen`, `cohere`, `funasr_nano`,
@@ -149,9 +152,9 @@ reports the model's default-context ceiling (`n_ctx == 0`); it is not re-derived
 for a session that narrows `n_ctx`. A session that lowers `n_ctx` may therefore
 reject audio shorter than the advertised `max_audio_ms`.
 
-Encoder-bound families are different. For cohere and canary, the input-audio
+Encoder-bound families are different. For canary, the input-audio
 limit is the encoder positional table, while `n_ctx` only bounds the decoder
-self-KV / output budget. In those families `transcribe_session_get_limits()`
+self-KV / output budget. There `transcribe_session_get_limits()`
 reports a smaller `effective_n_ctx` and `max_kv_bytes` when `n_ctx` is lowered,
 but `effective_max_audio_ms` stays pinned to the encoder input bound.
 

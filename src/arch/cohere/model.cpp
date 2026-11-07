@@ -5,6 +5,7 @@
 // has bias). The decoder is an autoregressive Transformer that runs
 // on the ggml graph (not host-side like Parakeet's LSTM).
 
+#include "chunking.h"
 #include "cohere.h"
 #include "decoder.h"
 #include "encoder.h"
@@ -229,11 +230,13 @@ namespace {
 constexpr float kBnEps = 1e-5f;
 
 // Input-length contract (canonical reference; see docs/input-limits.md).
-// Cohere ASR has TWO distinct limits:
+// run() splits input longer than the 35 s training clip into chunks
+// (chunking.h), so there is no limit on the whole input and
+// caps.max_audio_ms is 0. Per chunk, Cohere ASR has TWO distinct limits:
 //   (a) INPUT — the encoder's relative positional-encoding table
-//       (enc_pos_emb_max_len). T_enc must stay within the trained pos-emb
-//       span or the runtime table aliases past the trained range. Binding
-//       input bound, gated up front; drives caps.max_audio_ms.
+//       (enc_pos_emb_max_len, ~400 s). T_enc must stay within the trained
+//       pos-emb span or the runtime table aliases past the trained range.
+//       Still gated per decode; a 35 s chunk never reaches it.
 //   (b) DECODER self-KV — dec_max_seq and a 512 max-new-tokens cap. Bound
 //       the *output*: an over-budget transcript is kept as a partial result
 //       and flagged via transcribe_was_truncated(), not rejected.
@@ -266,8 +269,8 @@ int cohere_predict_t_enc(int mel_n_frames, int subsampling_factor) {
     return t;
 }
 
-// transcribe_capabilities::max_audio_ms: longest audio whose T_enc still
-// fits the trained pos-emb span enc_pos_emb_max_len. Inverts the rate:
+// Longest single decode whose T_enc still fits the trained pos-emb span
+// enc_pos_emb_max_len (used in the over-length log message). Inverts the rate:
 //   ms = T_enc * subsampling_factor * hop_length * 1000 / sr
 // at T_enc == enc_pos_emb_max_len. Returns 0 (unknown) if any rate hparam
 // is missing, so a misconfigured model is never advertised with a wrong value.
@@ -482,21 +485,19 @@ transcribe_status load(Loader & loader, const transcribe_model_load_params * par
         return st;
     }
 
-    // Publish the input-length ceiling now that the encoder pos-emb span
-    // and frontend rate are known (the encoder is the binding INPUT limit).
-    m->caps.max_audio_ms = cohere_max_audio_ms(m->hparams);
+    // run() chunks long input (chunking.h), so the whole input has no length
+    // limit: 0 means "no practical limit", as for whisper.
+    m->caps.max_audio_ms = 0;
 
     // Basis for the session-level limits query (transcribe_session_get_limits).
     // The LimitsBasis is a single context cap, filled from the DECODER side
-    // (dec_max_seq) so effective_n_ctx and max_kv_bytes are exact. Its derived
-    // effective_max_audio_ms therefore keys off the decoder ceiling and will
-    // NOT match caps.max_audio_ms (the encoder input bound) — for cohere the
-    // decoder context bounds the OUTPUT transcript, so that figure is advisory.
+    // (dec_max_seq) so effective_n_ctx and max_kv_bytes are exact. The decoder
+    // context bounds each chunk's OUTPUT transcript, not the audio length.
     if (m->hparams.dec_max_seq > 0 && m->hparams.enc_subsampling_factor > 0 && m->hparams.fe_hop_length > 0 &&
         m->hparams.fe_sample_rate > 0) {
         m->limits.has_context_cap        = true;
-        // Audio bound is the encoder table (caps.max_audio_ms), not the
-        // decoder context, so effective_max_audio_ms must not shrink with n_ctx.
+        // Audio is chunked, so effective_max_audio_ms follows caps.max_audio_ms
+        // (0, unbounded) and must not shrink with n_ctx.
         m->limits.audio_from_caps        = true;
         m->limits.model_max_ctx          = m->hparams.dec_max_seq;
         // Fixed control-token preamble (see run()'s prompt_pieces). Audio is
@@ -648,10 +649,12 @@ transcribe_status init_context(transcribe_model *                model,
     return TRANSCRIBE_OK;
 }
 
-transcribe_status run(transcribe_session *          session,
-                      const float *                 pcm,
-                      int                           n_samples,
-                      const transcribe_run_params * params) {
+// One encoder pass + one greedy decode over the whole of pcm. run() calls it
+// once per chunk of at most 35 s.
+transcribe_status run_one(transcribe_session *          session,
+                          const float *                 pcm,
+                          int                           n_samples,
+                          const transcribe_run_params * params) {
     if (session == nullptr || pcm == nullptr || n_samples <= 0) {
         return TRANSCRIBE_ERR_INVALID_ARG;
     }
@@ -662,7 +665,7 @@ transcribe_status run(transcribe_session *          session,
         return TRANSCRIBE_ERR_INVALID_ARG;
     }
 
-    // Pre-run abort check (cohere is single-chunk today).
+    // Pre-run abort check (also runs before each chunk).
     if (cc->poll_abort()) {
         return TRANSCRIBE_ERR_ABORTED;
     }
@@ -694,11 +697,10 @@ transcribe_status run(transcribe_session *          session,
     if (cm->hparams.enc_pos_emb_max_len > 0) {
         const int t_enc_pred = cohere_predict_t_enc(mel_n_frames, cm->hparams.enc_subsampling_factor);
         if (t_enc_pred > cm->hparams.enc_pos_emb_max_len) {
-            const double max_s = static_cast<double>(cm->caps.max_audio_ms) / 1000.0;
+            const double max_s = static_cast<double>(cohere_max_audio_ms(cm->hparams)) / 1000.0;
             transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
                                 "cohere run: input too long — %d encoder frames exceed the %d "
-                                "the model supports (~%.0f s max). See "
-                                "transcribe_capabilities.max_audio_ms.",
+                                "the model supports (~%.0f s max).",
                                 t_enc_pred, cm->hparams.enc_pos_emb_max_len, max_s);
             return TRANSCRIBE_ERR_INPUT_TOO_LONG;
         }
@@ -1348,6 +1350,69 @@ transcribe_status run(transcribe_session *          session,
     return cc->truncation_status();
 }
 
+// Input up to 35 s goes through run_one unchanged. Longer input is split at
+// quiet points (chunking.h, as the reference processor does), each chunk is
+// decoded on its own, and the texts are joined into one text-only segment.
+// A truncated or looping chunk keeps its partial text and the rest still
+// decode; the final status reports it. Any other failure stops the run and
+// keeps the text decoded so far, as an abort does.
+transcribe_status run(transcribe_session *          session,
+                      const float *                 pcm,
+                      int                           n_samples,
+                      const transcribe_run_params * params) {
+    if (session == nullptr || pcm == nullptr || n_samples <= 0) {
+        return TRANSCRIBE_ERR_INVALID_ARG;
+    }
+    auto * cc = static_cast<CohereSession *>(session);
+
+    const ChunkParams chunk_params{};
+    const auto        chunks = split_long_audio(pcm, n_samples, chunk_params);
+    if (chunks.size() <= 1) {
+        return run_one(session, pcm, n_samples, params);
+    }
+    log_msg(TRANSCRIBE_LOG_LEVEL_INFO, "cohere run: %.1f s input split into %zu chunks of at most %.0f s",
+            n_samples / 16000.0, chunks.size(), chunk_params.chunk_samples / 16000.0);
+
+    std::vector<std::string> texts;
+    std::string              raw;
+    int64_t                  mel_us = 0, enc_us = 0, dec_us = 0;
+    transcribe_status        st = TRANSCRIBE_OK;
+    for (const Chunk & c : chunks) {
+        cc->clear_result();
+        st = run_one(session, pcm + c.start, static_cast<int>(c.n_samples), params);
+        if (cc->has_result) {
+            texts.push_back(cc->full_text);
+            raw += cc->raw_text;
+        }
+        mel_us += cc->t_mel_us;
+        enc_us += cc->t_encode_us;
+        dec_us += cc->t_decode_us;
+        if (st != TRANSCRIBE_OK && st != TRANSCRIBE_ERR_OUTPUT_TRUNCATED && st != TRANSCRIBE_ERR_OUTPUT_REPETITION) {
+            break;
+        }
+    }
+
+    const char * lang = (params && params->language) ? params->language : "en";
+    std::string  full = join_chunk_texts(texts, lang);
+    cc->clear_result();
+    cc->t_mel_us    = mel_us;
+    cc->t_encode_us = enc_us;
+    cc->t_decode_us = dec_us;
+    if (!full.empty()) {
+        transcribe_session::SegmentEntry seg;
+        seg.text = full;
+        cc->segments.push_back(std::move(seg));
+        cc->full_text   = std::move(full);
+        cc->raw_text    = std::move(raw);
+        cc->result_kind = TRANSCRIBE_TIMESTAMPS_NONE;
+        cc->has_result  = true;
+    }
+    if (st != TRANSCRIBE_OK && st != TRANSCRIBE_ERR_OUTPUT_TRUNCATED && st != TRANSCRIBE_ERR_OUTPUT_REPETITION) {
+        return st;
+    }
+    return cc->truncation_status();
+}
+
 // ===========================================================================
 // Offline batched decode (transcribe_run_batch)
 // ===========================================================================
@@ -1493,6 +1558,13 @@ transcribe_status run_batch(transcribe_session *          session,
     if (n == 1 || !cc->decoder_use_flash || !primary_is_gpu || transcribe::debug::enabled()) {
         return run_batch_serial(cc, pcm, n_samples, n, params);
     }
+    // An utterance longer than one chunk needs run()'s chunking, which the
+    // batched decode does not do: decode the whole batch serially.
+    for (int b = 0; b < n; ++b) {
+        if (n_samples[b] > ChunkParams{}.chunk_samples) {
+            return run_batch_serial(cc, pcm, n_samples, n, params);
+        }
+    }
 
     transcribe::debug::init();
     const auto & hp      = cm->hparams;
@@ -1559,11 +1631,10 @@ transcribe_status run_batch(transcribe_session *          session,
         if (cm->hparams.enc_pos_emb_max_len > 0) {
             const int t_enc_pred = cohere_predict_t_enc(mel_nf[b], cm->hparams.enc_subsampling_factor);
             if (t_enc_pred > cm->hparams.enc_pos_emb_max_len) {
-                const double max_s = static_cast<double>(cm->caps.max_audio_ms) / 1000.0;
+                const double max_s = static_cast<double>(cohere_max_audio_ms(cm->hparams)) / 1000.0;
                 transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
                                     "cohere run_batch: utterance %d too long — %d encoder frames "
-                                    "exceed the %d the model supports (~%.0f s max). See "
-                                    "transcribe_capabilities.max_audio_ms.",
+                                    "exceed the %d the model supports (~%.0f s max).",
                                     b, t_enc_pred, cm->hparams.enc_pos_emb_max_len, max_s);
                 reject_status[b] = TRANSCRIBE_ERR_INPUT_TOO_LONG;
                 valid[b]         = 0;
