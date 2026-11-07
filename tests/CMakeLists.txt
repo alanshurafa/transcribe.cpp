@@ -218,6 +218,13 @@ target_include_directories(transcribe_parakeet_longform_unit PRIVATE ${CMAKE_SOU
 transcribe_apply_warnings(transcribe_parakeet_longform_unit)
 add_test(NAME transcribe_parakeet_longform_unit COMMAND transcribe_parakeet_longform_unit)
 
+# Cohere long-form split (vs the reference processor's cut points) and join.
+add_executable(transcribe_cohere_chunking_unit cohere_chunking_unit.cpp)
+target_link_libraries(transcribe_cohere_chunking_unit PRIVATE transcribe ggml)
+target_include_directories(transcribe_cohere_chunking_unit PRIVATE ${CMAKE_SOURCE_DIR}/src)
+transcribe_apply_warnings(transcribe_cohere_chunking_unit)
+add_test(NAME transcribe_cohere_chunking_unit COMMAND transcribe_cohere_chunking_unit)
+
 # -----------------------------------------------------------------------------
 # Variable-length batch mask and causal subsampling unit test
 # -----------------------------------------------------------------------------
