@@ -1345,6 +1345,9 @@ struct vk_instance_t {
     PFN_vkCmdInsertDebugUtilsLabelEXT  pfn_vkCmdInsertDebugUtilsLabelEXT  = {};
 
     std::vector<size_t> device_indices;
+    // physical device handles from the enumeration that produced device_indices;
+    // the loader's order can change later (e.g. on Windows), the handles do not
+    std::vector<vk::PhysicalDevice> physical_devices;
     std::vector<bool>   device_supports_membudget;
     vk_device devices[GGML_VK_MAX_DEVICES];
 };

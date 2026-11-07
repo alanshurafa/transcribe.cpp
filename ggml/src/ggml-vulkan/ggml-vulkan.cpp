@@ -3999,16 +3999,14 @@ vk_device ggml_vk_get_device(size_t idx) {
 
         device->memory_logger = std::unique_ptr<vk_memory_logger>(new vk_memory_logger());
 
-        size_t dev_num = vk_instance.device_indices[idx];
-
-        std::vector<vk::PhysicalDevice> physical_devices = vk_instance.instance.enumeratePhysicalDevices();
-
-        if (dev_num >= physical_devices.size()) {
-            std::cerr << "ggml_vulkan: Device with index " << dev_num << " does not exist." << std::endl;
+        if (idx >= vk_instance.physical_devices.size()) {
+            std::cerr << "ggml_vulkan: Device with index " << idx << " does not exist." << std::endl;
             throw std::runtime_error("Device not found");
         }
 
-        device->physical_device = physical_devices[dev_num];
+        // use the handle from instance init rather than re-enumerating: the loader's
+        // order can change in between, and device_indices would then pick another GPU
+        device->physical_device = vk_instance.physical_devices[idx];
         const std::vector<vk::ExtensionProperties> ext_props = device->physical_device.enumerateDeviceExtensionProperties();
 
         device->architecture = get_device_architecture(device->physical_device);
@@ -4933,15 +4931,9 @@ static void ggml_vk_print_gpu_info(size_t idx) {
     size_t dev_num = vk_instance.device_indices[idx];
     VK_LOG_DEBUG("ggml_vk_print_gpu_info(" << dev_num << ")");
     GGML_ASSERT(vk_instance_initialized);
+    GGML_ASSERT(idx < vk_instance.physical_devices.size());
 
-    std::vector<vk::PhysicalDevice> devices = vk_instance.instance.enumeratePhysicalDevices();
-
-    if (dev_num >= devices.size()) {
-        std::cerr << "ggml_vulkan: Device with index " << dev_num << " does not exist." << std::endl;
-        throw std::runtime_error("Device not found");
-    }
-
-    vk::PhysicalDevice physical_device = devices[dev_num];
+    vk::PhysicalDevice physical_device = vk_instance.physical_devices[idx];
     std::vector<vk::ExtensionProperties> ext_props = physical_device.enumerateDeviceExtensionProperties();
 
     bool fp16_storage = false;
@@ -5410,10 +5402,15 @@ void ggml_vk_instance_init() {
             return;
         }
     }
+
+    for (size_t idx : vk_instance.device_indices) {
+        vk_instance.physical_devices.push_back(devices[idx]);
+    }
+
     GGML_LOG_DEBUG("ggml_vulkan: Found %zu Vulkan devices:\n", vk_instance.device_indices.size());
 
     for (size_t i = 0; i < vk_instance.device_indices.size(); i++) {
-        vk::PhysicalDevice vkdev = devices[vk_instance.device_indices[i]];
+        vk::PhysicalDevice vkdev = vk_instance.physical_devices[i];
         std::vector<vk::ExtensionProperties> extensionprops = vkdev.enumerateDeviceExtensionProperties();
 
         bool membudget_supported = false;
@@ -12903,11 +12900,10 @@ int ggml_vk_get_device_count() {
 
 void ggml_vk_get_device_description(int device, char * description, size_t description_size) {
     ggml_vk_instance_init();
-
-    std::vector<vk::PhysicalDevice> devices = vk_instance.instance.enumeratePhysicalDevices();
+    GGML_ASSERT(device >= 0 && device < (int) vk_instance.physical_devices.size());
 
     vk::PhysicalDeviceProperties props;
-    devices[device].getProperties(&props);
+    vk_instance.physical_devices[device].getProperties(&props);
 
     snprintf(description, description_size, "%s", props.deviceName.data());
 }
@@ -15181,15 +15177,14 @@ int ggml_backend_vk_get_device_count() {
 
 void ggml_backend_vk_get_device_description(int device, char * description, size_t description_size) {
     GGML_ASSERT(device < (int) vk_instance.device_indices.size());
-    int dev_idx = vk_instance.device_indices[device];
-    ggml_vk_get_device_description(dev_idx, description, description_size);
+    ggml_vk_get_device_description(device, description, description_size);
 }
 
 void ggml_backend_vk_get_device_memory(int device, size_t * free, size_t * total) {
     GGML_ASSERT(device < (int) vk_instance.device_indices.size());
     GGML_ASSERT(device < (int) vk_instance.device_supports_membudget.size());
 
-    vk::PhysicalDevice vkdev = vk_instance.instance.enumeratePhysicalDevices()[vk_instance.device_indices[device]];
+    vk::PhysicalDevice vkdev = vk_instance.physical_devices[device];
     vk::PhysicalDeviceMemoryBudgetPropertiesEXT budgetprops;
     vk::PhysicalDeviceMemoryProperties2 memprops = {};
     const bool membudget_supported = vk_instance.device_supports_membudget[device];
@@ -15221,7 +15216,7 @@ void ggml_backend_vk_get_device_memory(int device, size_t * free, size_t * total
 static vk::PhysicalDeviceType ggml_backend_vk_get_device_type(int device_idx) {
     GGML_ASSERT(device_idx >= 0 && device_idx < (int) vk_instance.device_indices.size());
 
-    vk::PhysicalDevice device = vk_instance.instance.enumeratePhysicalDevices()[vk_instance.device_indices[device_idx]];
+    vk::PhysicalDevice device = vk_instance.physical_devices[device_idx];
 
     vk::PhysicalDeviceProperties2 props = {};
     device.getProperties2(&props);
@@ -15232,7 +15227,7 @@ static vk::PhysicalDeviceType ggml_backend_vk_get_device_type(int device_idx) {
 static std::string ggml_backend_vk_get_device_pci_id(int device_idx) {
     GGML_ASSERT(device_idx >= 0 && device_idx < (int) vk_instance.device_indices.size());
 
-    vk::PhysicalDevice device = vk_instance.instance.enumeratePhysicalDevices()[vk_instance.device_indices[device_idx]];
+    vk::PhysicalDevice device = vk_instance.physical_devices[device_idx];
 
     const std::vector<vk::ExtensionProperties> ext_props = device.enumerateDeviceExtensionProperties();
 
